@@ -1,0 +1,189 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>PoseDatasetHarvester2 — Prototype</title>
+  <style>
+    body{font-family: system-ui,Segoe UI,Arial; margin:20px; color:#222}
+    textarea{width:100%;height:160px;font-family:monospace}
+    input[type=file]{display:block;margin:8px 0}
+    button{padding:8px 12px;margin:6px 0}
+    pre{background:#f7f7f7;padding:8px;border:1px solid #eee}
+  </style>
+</head>
+<body>
+  <h2>PoseDatasetHarvester2 (prototype)</h2>
+  <p>I live in a small museum and like neat data. This page accepts files you upload or raw text you paste. It will try to detect CSV, JSON, or simple MATLAB .mat and normalize pose/time-series into a single CSV and a provenance log.</p>
+
+  <input id="files" type="file" multiple />
+  <label>Or paste raw file content below (use for copied text or fetched files):</label>
+  <textarea id="pasted" placeholder="Paste file contents here (optionally prefix with a filename line like: --- filename.csv ---)"></textarea>
+  <button id="process">Process</button>
+  <h3>Report</h3>
+  <pre id="report">No processing yet.</pre>
+
+  <script>
+    // Helper parsers
+    function guessFormat(name, content) {
+      name = (name||'').toLowerCase();
+      if (name.endsWith('.csv')) return 'csv';
+      if (name.endsWith('.json')) return 'json';
+      if (name.endsWith('.mat')) return 'mat';
+      // heuristic
+      if (typeof content === 'string') {
+        const s = content.trim();
+        if (s.startsWith('{') || s.startsWith('[')) return 'json';
+        if (s.split(/\r?\n/)[0].split(',').length>1) return 'csv';
+      }
+      if (content instanceof ArrayBuffer) return 'mat';
+      return 'unknown';
+    }
+
+    function parseCSV(text) {
+      const lines = text.split(/\r?\n/).filter(l=>l.trim()!=="");
+      const rows = lines.map(l=>l.split(',').map(x=>x.trim()));
+      const header = rows.shift();
+      return rows.map(r=>{
+        const obj = {};
+        header.forEach((h,i)=>obj[h]=r[i]);
+        return obj;
+      });
+    }
+
+    function flattenJSON(obj) {
+      // Look for arrays of objects likely to be time series
+      if (Array.isArray(obj)) return obj;
+      // if object with keys that map to arrays, try to transpose
+      const keys = Object.keys(obj);
+      if (keys.length>0 && Array.isArray(obj[keys[0]])) {
+        const n = obj[keys[0]].length;
+        const out = [];
+        for (let i=0;i<n;i++){ const row={}; keys.forEach(k=>row[k]=obj[k][i]); out.push(row);} 
+        return out;
+      }
+      // otherwise not recognized
+      return null;
+    }
+
+    function tryParseMAT(buffer) {
+      // Very small heuristic parser for MAT v5 with a single numeric matrix variable.
+      try {
+        const dv = new DataView(buffer);
+        const header = new Uint8Array(buffer,0,4); // not robust
+        // look for 'MATLAB' ascii in header bytes 0-127
+        const textHeader = new TextDecoder().decode(new Uint8Array(buffer,0,128));
+        if (!/MATLAB/.test(textHeader)) return {error:'not a recognizable MAT v5 header'};
+        // this prototype will not fully parse MAT files; return error message indicating limitation.
+        return {error:'MAT parsing is limited in prototype; please convert .mat to JSON/CSV before uploading.'};
+      } catch(e){
+        return {error: 'mat parse exception: '+String(e)};
+      }
+    }
+
+    function normalizeRow(r) {
+      // Try to pick common field names for time, module, position, orientation
+      const out = {
+        time: r.time || r.t || r.timestamp || r.Timestamp || '',
+        module_id: r.module_id || r.module || r.id || r.segment || r.name || '',
+        position_x: r.x || r.pos_x || r.position_x || r.position?.x || '',
+        position_y: r.y || r.pos_y || r.position_y || r.position?.y || '',
+        position_z: r.z || r.pos_z || r.position_z || r.position?.z || '',
+        orientation_w: r.w || r.orient_w || r.quat_w || '',
+        orientation_x: r.qx || r.orient_x || r.quat_x || '',
+        orientation_y: r.qy || r.orient_y || r.quat_y || '',
+        orientation_z: r.qz || r.orient_z || r.quat_z || ''
+      };
+      return out;
+    }
+
+    document.getElementById('process').addEventListener('click', async ()=>{
+      const fileInput = document.getElementById('files');
+      const pasted = document.getElementById('pasted').value;
+      const report = [];
+      const provenance = [];
+      let combined = [];
+
+      // Handle uploaded files
+      for (const f of fileInput.files) {
+        const name = f.name;
+        const ab = await f.arrayBuffer();
+        const text = await (new Response(ab)).text().catch(()=>null);
+        const fmt = guessFormat(name, text||ab);
+        report.push(name+': detected '+fmt);
+        provenance.push({file:name, format:fmt, size:f.size});
+        if (fmt==='csv' && text) {
+          try{
+            const rows = parseCSV(text);
+            rows.forEach(r=>combined.push(normalizeRow(r)));
+            report.push(name+': parsed CSV rows='+rows.length);
+          }catch(e){report.push(name+': csv parse error '+e)}
+        } else if (fmt==='json' && text) {
+          try{
+            const obj = JSON.parse(text);
+            const rows = flattenJSON(obj);
+            if (rows){ rows.forEach(r=>combined.push(normalizeRow(r))); report.push(name+': parsed JSON rows='+rows.length);} else {report.push(name+': JSON structure not recognized');}
+          }catch(e){report.push(name+': json parse error '+e)}
+        } else if (fmt==='mat') {
+          const r = tryParseMAT(ab);
+          if (r.error) { report.push(name+': mat parser: '+r.error); }
+          else { /* not reached in prototype */ }
+        } else {
+          report.push(name+': unknown format or not text');
+        }
+      }
+
+      // Handle pasted content: support multiple blocks separated by --- filename ---
+      if (pasted && pasted.trim()){
+        const parts = pasted.split(/(^---\s*(.*?)\s*---$)/m);
+        if (parts.length>1) {
+          // parts includes separators; parse simple pattern
+          // naive: find lines like --- name --- then next chunk
+          const lines = pasted.split(/\r?\n/);
+          // attempt single block with optional first line filename
+          const firstLine = lines[0];
+          let name = 'pasted.txt';
+          let body = pasted;
+          const m = firstLine.match(/^---\s*(.*?)\s*---$/);
+          if (m) { name = m[1]; body = lines.slice(1).join('\n'); }
+          const fmt = guessFormat(name, body);
+          report.push(name+': detected '+fmt+' (pasted)');
+          provenance.push({file:name, format:fmt, size: body.length});
+          if (fmt==='csv'){
+            try{ const rows = parseCSV(body); rows.forEach(r=>combined.push(normalizeRow(r))); report.push(name+': parsed CSV rows='+rows.length);}catch(e){report.push(name+': csv parse error '+e)}
+          } else if (fmt==='json'){
+            try{ const obj = JSON.parse(body); const rows = flattenJSON(obj); if (rows){rows.forEach(r=>combined.push(normalizeRow(r))); report.push(name+': parsed JSON rows='+rows.length);} else report.push(name+': JSON structure not recognized'); }catch(e){report.push(name+': json parse error '+e)}
+          } else { report.push(name+': unknown pasted format'); }
+        }
+      }
+
+      // Build normalized CSV
+      const headers = ['time','module_id','position_x','position_y','position_z','orientation_w','orientation_x','orientation_y','orientation_z'];
+      const csvRows = [headers.join(',')];
+      combined.forEach(r=>{
+        const row = headers.map(h=>{
+          let v = r[h];
+          if (v===undefined || v===null) return '';
+          // if object, try JSON
+          if (typeof v==='object') return JSON.stringify(v);
+          return String(v).replace(/\n/g,' ');
+        });
+        csvRows.push(row.join(','));
+      });
+
+      const csvBlob = new Blob([csvRows.join('\n')], {type:'text/csv'});
+      const provBlob = new Blob([JSON.stringify({provenance:provenance, report:report}, null, 2)], {type:'application/json'});
+
+      // Update report area
+      document.getElementById('report').textContent = report.join('\n') + '\n\nNormalized rows: ' + combined.length + '\n\nProvenance logged for ' + provenance.length + ' file(s).';
+
+      // Offer downloads
+      const dl1 = document.createElement('a'); dl1.href = URL.createObjectURL(csvBlob); dl1.download = 'normalized_poses.csv'; dl1.textContent = 'Download normalized CSV'; dl1.style.display='block';
+      const dl2 = document.createElement('a'); dl2.href = URL.createObjectURL(provBlob); dl2.download = 'provenance.json'; dl2.textContent = 'Download provenance log'; dl2.style.display='block';
+      // clear old links
+      const existing = document.getElementById('dlwrap'); if (existing) existing.remove();
+      const wrap = document.createElement('div'); wrap.id='dlwrap'; wrap.appendChild(dl1); wrap.appendChild(dl2);
+      document.body.appendChild(wrap);
+    });
+  </script>
+</body>
+</html>
